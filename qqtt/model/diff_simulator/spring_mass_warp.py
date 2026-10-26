@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from qqtt.utils import logger, cfg
 import warp as wp
@@ -556,6 +557,88 @@ def integrate_ground_collision(
     x_new[tid] = x0 + v0 * toi + v1 * (dt - toi)
     v_new[tid] = v1
 
+
+@wp.kernel(enable_backward=False)
+def kinematic_sdf_collision_batched(
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    sdf_ids: wp.array(dtype=wp.uint64),
+    sdf_centers: wp.array(dtype=wp.vec3),
+    sdf_rotations: wp.array(dtype=wp.mat33),
+    collider_velocities: wp.array(dtype=wp.vec3),
+    sdf_half_extents: wp.array(dtype=wp.vec3),
+    collide_elas: wp.array(dtype=float),
+    collide_fric: wp.array(dtype=float),
+    dt: float,
+    substep: int,
+    num_substeps: int,
+    num_colliders: int,
+    object_massnodes_single: int,
+    margin: float,
+    v_new: wp.array(dtype=wp.vec3),
+    collision_counts: wp.array(dtype=wp.int32),
+    contact_flags: wp.array(dtype=wp.int32),
+):
+    """Resolve moving gripper SDFs against BOBA particles independently per batch."""
+    tid = wp.tid()
+    instance = tid // object_massnodes_single
+    pose_base = (instance * num_substeps + substep) * num_colliders
+
+    x0 = x[tid]
+    velocity = v[tid]
+    predicted = x0 + velocity * dt
+
+    for collider in range(num_colliders):
+        pose_index = pose_base + collider
+        center = sdf_centers[pose_index]
+        rotation = sdf_rotations[pose_index]
+        half_extents = sdf_half_extents[collider]
+        local = wp.transpose(rotation) * (predicted - center)
+
+        if (wp.abs(local[0]) < half_extents[0] + margin and
+            wp.abs(local[1]) < half_extents[1] + margin and
+            wp.abs(local[2]) < half_extents[2] + margin):
+            sdf_id = sdf_ids[collider]
+            uvw = wp.volume_world_to_index(sdf_id, local)
+            gradient = wp.vec3(0.0, 0.0, 0.0)
+            distance = wp.volume_sample_grad_f(
+                sdf_id, uvw, wp.Volume.LINEAR, gradient
+            )
+            penetration = margin - distance
+            gradient_length = wp.length(gradient)
+
+            if distance < 1.0e5 and penetration > 0.0 and gradient_length > 1.0e-8:
+                normal = rotation * (gradient / gradient_length)
+                surface_velocity = collider_velocities[pose_index]
+                relative_velocity = velocity - surface_velocity
+                normal_speed = wp.dot(relative_velocity, normal)
+                normal_velocity = normal_speed * normal
+                tangent_velocity = relative_velocity - normal_velocity
+
+                restitution = wp.clamp(collide_elas[0], 0.0, 1.0)
+                friction = wp.clamp(collide_fric[0], 0.0, 2.0)
+                corrected_normal_speed = normal_speed
+                if normal_speed < 0.0:
+                    corrected_normal_speed = -restitution * normal_speed
+
+                tangent_speed = wp.max(wp.length(tangent_velocity), 1.0e-8)
+                tangent_scale = wp.max(
+                    0.0,
+                    1.0 - friction * (1.0 + restitution)
+                    * wp.abs(normal_speed) / tangent_speed,
+                )
+                velocity = (
+                    surface_velocity
+                    + corrected_normal_speed * normal
+                    + tangent_scale * tangent_velocity
+                    + normal * penetration / dt
+                )
+                predicted = x0 + velocity * dt
+                wp.atomic_add(collision_counts, instance, 1)
+                contact_flags[tid] = 1
+
+    v_new[tid] = velocity
+
 class SpringMassSystemWarp:
     def __init__(
         self,
@@ -588,6 +671,10 @@ class SpringMassSystemWarp:
         controller_rest_location,
         number_of_instance,
         sim_force_mode=SIM_FORCE_MODE_GATHER,
+        kinematic_sdf_volumes=None,
+        collide_eef_elas=None,
+        collide_eef_fric=None,
+        kinematic_sdf_margin=0.002,
     ):
         logger.info(f"[SIMULATION]: Initialize the Spring-Mass System")
         self.device = cfg.device
@@ -727,6 +814,58 @@ class SpringMassSystemWarp:
         self.number_of_instance = number_of_instance
         self.max_incident_springs = int(max_incident_springs)
 
+        self.has_kinematic_sdf_collision = bool(kinematic_sdf_volumes)
+        self.num_kinematic_sdf_colliders = 0
+        self.kinematic_sdf_margin = float(kinematic_sdf_margin)
+        self.wp_kinematic_collision_counts = wp.zeros(
+            number_of_instance, dtype=wp.int32, device=self.device
+        )
+        self.wp_kinematic_contact_flags = wp.zeros(
+            object_massnodes_total, dtype=wp.int32, device=self.device
+        )
+        if self.has_kinematic_sdf_collision:
+            self._kinematic_sdf_volume_refs = list(kinematic_sdf_volumes)
+            self.num_kinematic_sdf_colliders = len(self._kinematic_sdf_volume_refs)
+            sdf_ids = np.asarray(
+                [volume.volume_id for volume in self._kinematic_sdf_volume_refs],
+                dtype=np.uint64,
+            )
+            sdf_half_extents = np.asarray(
+                [volume.half_extents for volume in self._kinematic_sdf_volume_refs],
+                dtype=np.float32,
+            )
+            self.wp_kinematic_sdf_ids = wp.array(
+                sdf_ids, dtype=wp.uint64, device=self.device
+            )
+            self.wp_kinematic_sdf_half_extents = wp.array(
+                sdf_half_extents, dtype=wp.vec3, device=self.device
+            )
+            pose_count = (
+                number_of_instance * self.num_substeps
+                * self.num_kinematic_sdf_colliders
+            )
+            self.wp_kinematic_sdf_centers = wp.zeros(
+                pose_count, dtype=wp.vec3, device=self.device
+            )
+            self.wp_kinematic_sdf_rotations = wp.zeros(
+                pose_count, dtype=wp.mat33, device=self.device
+            )
+            self.wp_kinematic_sdf_velocities = wp.zeros(
+                pose_count, dtype=wp.vec3, device=self.device
+            )
+            if collide_eef_elas is None:
+                collide_eef_elas = collide_elas
+            if collide_eef_fric is None:
+                collide_eef_fric = collide_fric
+            self.wp_collide_eef_elas = wp.from_torch(
+                collide_eef_elas.to(self.device, torch.float32).reshape(1).contiguous(),
+                requires_grad=False,
+            )
+            self.wp_collide_eef_fric = wp.from_torch(
+                collide_eef_fric.to(self.device, torch.float32).reshape(1).contiguous(),
+                requires_grad=False,
+            )
+
         self.wp_init_velocities = None
         if init_velocities is None:
             self.wp_init_velocities = wp.zeros(
@@ -825,6 +964,30 @@ class SpringMassSystemWarp:
             outputs=[self.wp_states[0].wp_v],
         )
 
+    def set_kinematic_sdf_trajectory(self, centers, rotations, velocities):
+        """Upload (batch, substep, collider, ...) gripper transforms."""
+        if not self.has_kinematic_sdf_collision:
+            raise RuntimeError("No kinematic SDF colliders were configured")
+        expected = (
+            self.number_of_instance,
+            self.num_substeps,
+            self.num_kinematic_sdf_colliders,
+        )
+        if tuple(centers.shape[:3]) != expected:
+            raise ValueError(f"Expected collider trajectory {expected}, got {centers.shape[:3]}")
+        flat_centers = centers.reshape(-1, 3).to(self.device, torch.float32).contiguous()
+        flat_rotations = rotations.reshape(-1, 3, 3).to(self.device, torch.float32).contiguous()
+        flat_velocities = velocities.reshape(-1, 3).to(self.device, torch.float32).contiguous()
+        wp.copy(self.wp_kinematic_sdf_centers, wp.from_torch(flat_centers, dtype=wp.vec3))
+        wp.copy(self.wp_kinematic_sdf_rotations, wp.from_torch(flat_rotations, dtype=wp.mat33))
+        wp.copy(self.wp_kinematic_sdf_velocities, wp.from_torch(flat_velocities, dtype=wp.vec3))
+
+    def get_kinematic_collision_counts(self):
+        return wp.to_torch(self.wp_kinematic_collision_counts).clone()
+
+    def get_kinematic_contact_flags(self):
+        return wp.to_torch(self.wp_kinematic_contact_flags).clone()
+
     def update_collision_graph(self):
         #pyh build a big hash grid over all instances are ok as long as the offset is big
         self.collision_grid.build(self.wp_states[0].wp_x, self.collision_dist * 5.0)
@@ -846,6 +1009,9 @@ class SpringMassSystemWarp:
 
 
     def step(self):
+        if self.has_kinematic_sdf_collision:
+            self.wp_kinematic_collision_counts.zero_()
+            self.wp_kinematic_contact_flags.zero_()
         for i in range(self.num_substeps):
             self.wp_states[i].clear_forces()
 
@@ -974,6 +1140,40 @@ class SpringMassSystemWarp:
                         #added
                         self.object_massnode_single,
                     ],
+                    outputs=[self.wp_states[i].wp_v_before_ground],
+                )
+
+            if self.has_kinematic_sdf_collision:
+                wp.launch(
+                    kernel=kinematic_sdf_collision_batched,
+                    dim=self.object_massnode_total,
+                    inputs=[
+                        self.wp_states[i].wp_x,
+                        self.wp_states[i].wp_v_before_ground,
+                        self.wp_kinematic_sdf_ids,
+                        self.wp_kinematic_sdf_centers,
+                        self.wp_kinematic_sdf_rotations,
+                        self.wp_kinematic_sdf_velocities,
+                        self.wp_kinematic_sdf_half_extents,
+                        self.wp_collide_eef_elas,
+                        self.wp_collide_eef_fric,
+                        self.dt,
+                        i,
+                        self.num_substeps,
+                        self.num_kinematic_sdf_colliders,
+                        self.object_massnode_single,
+                        self.kinematic_sdf_margin,
+                    ],
+                    outputs=[
+                        self.wp_states[i].wp_v_before_collision,
+                        self.wp_kinematic_collision_counts,
+                        self.wp_kinematic_contact_flags,
+                    ],
+                )
+                wp.launch(
+                    copy_vec3,
+                    dim=self.object_massnode_total,
+                    inputs=[self.wp_states[i].wp_v_before_collision],
                     outputs=[self.wp_states[i].wp_v_before_ground],
                 )
 
