@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boba"
+version = "0.1.0"
+description = "Boba: batched PhysTwin spring-mass simulation (the qqtt package) as an installable library"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+# The physics path (qqtt.model.diff_simulator.SpringMassSystemWarp) needs only these. Gaussian/LBS
+# rendering (qqtt.engine, qqtt.utils.gaussian) additionally needs the pinned CUDA 13.2 stack from
+# env_install/phystwin-cu132.yml plus env_install/build_cuda13_extensions.sh - see README.md.
+dependencies = [
+    "numpy",
+    "torch",
+    "warp-lang>=1.12.1",
+    "PyYAML",
+    "termcolor",
+]
+
+[tool.setuptools.packages.find]
+include = ["qqtt*"]
